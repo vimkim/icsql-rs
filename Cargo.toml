@@ -1,0 +1,12 @@
+[package]
+name = "icsql-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+cap-std = "3.4.4"
+libc = "0.2.177"
+nix = { version = "0.30.1", features = ["term", "fs", "signal", "poll"] }
+signal-hook = "0.3.18"
+
