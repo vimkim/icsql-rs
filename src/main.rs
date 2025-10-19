@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
     set_winsz(&master_fd, &ws);
 
     // --- open FIFO reader + keepalive writer ------------------------------------
-    let (fifo_r, fifo_w) =
+    let (mut fifo_r, fifo_w) =
         open_fifo_rw(&fifo_path).map_err(|e| anyhow::anyhow!("open_fifo_rw: {e}"))?;
 
     // --- signal handling: SIGWINCH -> propagate; SIGINT -> forward to child -----
@@ -191,75 +191,84 @@ fn main() -> anyhow::Result<()> {
         PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),
     ];
 
+    // --- poll loop bridging PTY <-> stdout and FIFO/stdin -> PTY ----------------
     let stdout_fd = io::stdout();
     let mut stdout_lock = io::stdout().lock();
 
-    // ensure stdout is a dup’d raw fd writer for direct write
+    // dup stdout so we can write via a real fd
     let raw_fd = stdout_fd.as_raw_fd();
     let out_fd = unsafe { OwnedFd::from_raw_fd(libc::dup(raw_fd)) };
 
-    // logs are optional; keep console clean like the Python version (which logs to file)
     loop {
-        // wait indefinitely until something is readable
+        // Build pollfds fresh so every PollFd borrows current fds.
+        let mut pollfds = vec![
+            PollFd::new(master_fd.as_fd(), PollFlags::POLLIN), // idx 0
+            PollFd::new(fifo_r.as_fd(), PollFlags::POLLIN),    // idx 1
+            PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),  // idx 2
+        ];
+
         poll(&mut pollfds, PollTimeout::NONE).map_err(|e| anyhow::anyhow!("poll: {e}"))?;
 
+        // Snapshot readiness and then DROP the borrows before touching fifo_r.
+        let pty_ready = pollfds[0]
+            .revents()
+            .map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let fifo_ready = pollfds[1]
+            .revents()
+            .map_or(false, |r| r.contains(PollFlags::POLLIN));
+        let stdin_ready = pollfds[2]
+            .revents()
+            .map_or(false, |r| r.contains(PollFlags::POLLIN));
+        drop(pollfds); // <-- end of BorrowedFd lifetimes
+
         // PTY -> stdout
-        if let Some(revents) = pollfds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let mut buf = [0u8; 4096];
-                match read(master_fd.as_fd(), &mut buf) {
-                    Ok(0) => break, // child closed
-                    Ok(n) => {
-                        // write to stdout
-                        let _ = write(out_fd.as_fd(), &buf[..n]);
-                        let _ = stdout_lock.flush();
-                    }
-                    Err(e) if e == Errno::EIO => break, // child exited
-                    Err(Errno::EAGAIN) => {}
-                    Err(e) => return Err(anyhow::anyhow!("read pty: {e}")),
+        if pty_ready {
+            let mut buf = [0u8; 4096];
+            match read(master_fd.as_fd(), &mut buf) {
+                Ok(0) => break, // child closed
+                Ok(n) => {
+                    let _ = write(out_fd.as_fd(), &buf[..n]);
+                    let _ = stdout_lock.flush();
                 }
+                Err(e) if e == Errno::EIO => break, // child exited
+                Err(Errno::EAGAIN) => {}
+                Err(e) => return Err(anyhow::anyhow!("read pty: {e}")),
             }
         }
 
         // FIFO -> PTY
-        if let Some(revents) = pollfds[1].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let mut buf = [0u8; 4096];
-                match read(fifo_r.as_fd(), &mut buf) {
-                    Ok(0) => {
-                        // writer side closed; reopen reader to accept the next writer
-                        // unregister old fd in-place
-                        pollfds[1] = PollFd::new(-1 as RawFd, PollFlags::empty());
-                        let _ = close(fifo_r);
-                        match reopen_fifo_reader(&fifo_path) {
-                            Ok(newr) => {
-                                fifo_r = newr;
-                                pollfds[1] = PollFd::new(fifo_r.as_fd(), PollFlags::POLLIN);
-                            }
-                            Err(e) => return Err(anyhow::anyhow!("reopen fifo: {e}")),
+        if fifo_ready {
+            let mut buf = [0u8; 4096];
+            match read(fifo_r.as_fd(), &mut buf) {
+                Ok(0) => {
+                    // writer side closed; close + reopen for the next writer
+                    let _ = close(fifo_r); // move is allowed now (no active borrow)
+                    match reopen_fifo_reader(&fifo_path) {
+                        Ok(newr) => {
+                            fifo_r = newr; // reassign is fine now
+                            // next loop iteration will include the new fd in pollfds
                         }
+                        Err(e) => return Err(anyhow::anyhow!("reopen fifo: {e}")),
                     }
-                    Ok(n) => {
-                        let _ = write(master_fd.as_fd(), &buf[..n]);
-                    }
-                    Err(Errno::EAGAIN) => {}
-                    Err(e) => return Err(anyhow::anyhow!("read fifo: {e}")),
                 }
+                Ok(n) => {
+                    let _ = write(master_fd.as_fd(), &buf[..n]);
+                }
+                Err(Errno::EAGAIN) => {}
+                Err(e) => return Err(anyhow::anyhow!("read fifo: {e}")),
             }
         }
 
         // STDIN -> PTY
-        if let Some(revents) = pollfds[2].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                let mut buf = [0u8; 4096];
-                match read(stdin_fd, &mut buf) {
-                    Ok(0) => break, // stdin closed
-                    Ok(n) => {
-                        let _ = write(master_fd.as_fd(), &buf[..n]);
-                    }
-                    Err(Errno::EAGAIN) => {}
-                    Err(e) => return Err(anyhow::anyhow!("read stdin: {e}")),
+        if stdin_ready {
+            let mut buf = [0u8; 4096];
+            match read(stdin_fd, &mut buf) {
+                Ok(0) => break, // stdin closed
+                Ok(n) => {
+                    let _ = write(master_fd.as_fd(), &buf[..n]);
                 }
+                Err(Errno::EAGAIN) => {}
+                Err(e) => return Err(anyhow::anyhow!("read stdin: {e}")),
             }
         }
     }
